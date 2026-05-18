@@ -33,11 +33,6 @@ classifiers = [
     "Intended Audience :: Developers",
 ]
 
-[project.urls]
-Homepage = "https://github.com/AyushExel/lookback"
-Source = "https://github.com/AyushExel/lookback"
-Issues = "https://github.com/AyushExel/lookback/issues"
-
 dependencies = [
     "lancedb>=0.16",
     "pyarrow>=17",
@@ -58,6 +53,11 @@ dependencies = [
 
 [project.scripts]
 lookback = "lookback.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/AyushExel/lookback"
+Source = "https://github.com/AyushExel/lookback"
+Issues = "https://github.com/AyushExel/lookback/issues"
 
 [build-system]
 requires = ["hatchling"]
