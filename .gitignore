@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# uv
+.uv/
+
+# tests / coverage
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# type checkers
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Lookback runtime
+~/.lookback/
+*.lance/
+test-data/_tmp/
+
+# Local-only design notes / session log (kept on disk, not in the repo)
+DESIGN.md
