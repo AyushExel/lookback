@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import os
+import subprocess
+import sys
+from enum import StrEnum
 from pathlib import Path
 
 import typer
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from lookback.config import LookbackConfig, starter_toml
 from lookback.embed.factory import (
@@ -51,6 +56,19 @@ models_app = typer.Typer(
 app.add_typer(models_app, name="models")
 console = Console()
 err_console = Console(stderr=True)
+
+
+# Typer-friendly enums: typer auto-validates the value at parse time AND
+# renders the allowed set in `--help` as e.g. ``[text|image|all]``.
+class Modality(StrEnum):
+    text = "text"
+    image = "image"
+    all = "all"
+
+
+class Transport(StrEnum):
+    stdio = "stdio"
+    http = "http"
 
 
 VALID_TEXT_CHOICES = ["mock", *sorted(TEXT_MODELS.keys())]
@@ -250,41 +268,59 @@ def _run_index_with_progress(
 @app.command()
 def search(
     query: str = typer.Argument(..., help="Free-text query."),
-    limit: int = typer.Option(10, "--limit", "-n", min=1, help="Max results per modality."),
-    modality: str = typer.Option(
-        "all",
+    limit: int = typer.Option(
+        10, "--limit", "-n", min=1, help="Max results per modality."
+    ),
+    modality: Modality = typer.Option(
+        Modality.all,
         "--modality",
         "-m",
+        case_sensitive=False,
         help=(
-            "Which embedding space to query: "
-            "'text' (text table via the text embedder), "
-            "'image' (image table via the joint-space text encoder), "
-            "'all' (both — default)."
+            "Which embedding space to query. "
+            "'text' = the text table via your configured text embedder "
+            "(default: Nomic v1.5). "
+            "'image' = the image table via the joint-space text encoder "
+            "(default: MobileCLIP-S2 text tower) — this is how you find "
+            "screenshots by describing them. "
+            "'all' (default) = run both and show results in two grouped "
+            "sections."
         ),
     ),
     source_kind: str | None = typer.Option(
         None,
         "--source-kind",
-        help="Filter by source kind (markdown, python, screenshot, ...).",
+        help=(
+            "Restrict to one extractor's output, e.g. 'markdown', 'python', "
+            "'typescript', 'pdf', 'plaintext', 'screenshot'."
+        ),
     ),
     hybrid: bool = typer.Option(
         False,
         "--hybrid",
         help=(
             "Fuse full-text search with vector ranking on the text table "
-            "(no effect on image queries). Picks up exact-keyword matches "
-            "that vector search alone might miss."
+            "(no effect on --modality=image). Surfaces exact-keyword hits "
+            "(function names, error codes) that pure vector ranking can "
+            "drown out. Ignored when querying only images."
         ),
     ),
-    json_output: bool = typer.Option(False, "--json", help="Emit raw JSON instead of a table."),
-    config_path: Path | None = typer.Option(None, "--config", "-c"),
+    open_top: bool = typer.Option(
+        False,
+        "--open",
+        help=(
+            "After printing results, open the top hit with the system "
+            "default application (macOS: `open`; Linux: `xdg-open`)."
+        ),
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit raw JSON instead of a rendered table."
+    ),
+    config_path: Path | None = typer.Option(
+        None, "--config", "-c", help="Path to config.toml. Defaults to ~/.lookback/config.toml."
+    ),
 ) -> None:
     """Semantic search across the indexed corpus, text and/or images."""
-    if modality not in {"text", "image", "all"}:
-        raise typer.BadParameter(
-            f"--modality must be one of: text, image, all (got {modality!r})"
-        )
-
     config = LookbackConfig.load(config_path)
     store = LanceStore(config.data_dir)
     where = f"source_kind = '{source_kind}'" if source_kind else None
@@ -292,7 +328,7 @@ def search(
     text_hits: list[dict] = []
     image_hits: list[dict] = []
 
-    if modality in {"text", "all"}:
+    if modality in {Modality.text, Modality.all}:
         text_embedder = build_text_embedder(config)
         text_query_vec = text_embedder.embed_query(query)
         if hybrid:
@@ -302,10 +338,18 @@ def search(
         else:
             text_hits = store.search_text(text_query_vec, limit=limit, where=where)
 
-    if modality in {"image", "all"}:
+    if modality in {Modality.image, Modality.all}:
         image_text_embedder = build_image_text_embedder(config)
         image_query_vec = image_text_embedder.embed_query(query)
         image_hits = store.search_image(image_query_vec, limit=limit, where=where)
+
+    # Resolve file_id → absolute path so we can render clickable links
+    # and so JSON consumers don't need a second roundtrip.
+    file_ids = {h["file_id"] for h in (*text_hits, *image_hits) if h.get("file_id")}
+    paths_by_id = store.get_files_paths(file_ids) if file_ids else {}
+    for h in (*text_hits, *image_hits):
+        if h.get("file_id") in paths_by_id:
+            h["path"] = paths_by_id[h["file_id"]]
 
     if json_output:
         console.print_json(
@@ -323,31 +367,79 @@ def search(
     if image_hits:
         console.print("[bold]Image hits[/]")
         _render_hits_table(image_hits)
+    console.print()
+    console.print(
+        "[dim]Hint: Cmd-click (Mac) or Ctrl-click (Linux) the path column "
+        "to open the file. Use --open to open the top hit automatically.[/]"
+    )
+
+    if open_top:
+        top_path = (
+            (text_hits or image_hits)[0].get("path") if (text_hits or image_hits) else None
+        )
+        if top_path:
+            _open_with_system(Path(top_path))
+
+
+def _abbreviate_path(path: str) -> str:
+    """Replace the user's home dir with ``~`` for a tighter display column."""
+    home = str(Path.home())
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home) :]
+    return path
 
 
 def _render_hits_table(hits: list[dict]) -> None:
     table = Table(show_lines=False)
     table.add_column("score", justify="right", style="dim")
-    table.add_column("kind", style="cyan")
-    table.add_column("meta", style="green", overflow="fold")
-    table.add_column("text/file", overflow="fold")
+    table.add_column("kind", style="cyan", no_wrap=True)
+    table.add_column("path", style="green", overflow="fold")
+    table.add_column("snippet", overflow="fold")
 
     for h in hits:
-        meta = h.get("meta") or ""
         kind = h.get("source_kind", "?")
-        text = (h.get("text") or "").replace("\n", " ").strip()[:160]
+        text = (h.get("text") or "").replace("\n", " ").strip()[:200]
         # Vector search returns _distance (lower = better); hybrid returns
         # _relevance_score (higher = better). Both render as "score".
         score = h.get("_distance")
         if score is None:
             score = h.get("_relevance_score")
+
+        full_path = h.get("path")
+        if full_path:
+            display = _abbreviate_path(full_path)
+            # Rich renders this as an OSC-8 hyperlink in supported terminals
+            # (Terminal.app, iTerm2, kitty, VS Code, alacritty 0.11+).
+            path_cell: object = Text(display, style=f"link file://{full_path}")
+        else:
+            # Fall back to chunk meta if we couldn't resolve the path.
+            meta = h.get("meta") or ""
+            path_cell = str(meta)[:80]
+
         table.add_row(
             f"{score:.3f}" if isinstance(score, (int, float)) else "",
             kind,
-            str(meta)[:80],
+            path_cell,
             text or "(image)",
         )
     console.print(table)
+
+
+def _open_with_system(path: Path) -> None:
+    """Open ``path`` with the OS default application."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=False)
+        elif sys.platform.startswith("linux"):
+            subprocess.run(["xdg-open", str(path)], check=False)
+        elif sys.platform == "win32":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        else:
+            err_console.print(f"[yellow]don't know how to open files on {sys.platform}[/]")
+    except Exception as exc:
+        err_console.print(f"[red]failed to open {path}:[/] {exc}")
 
 
 @app.command()
@@ -411,15 +503,27 @@ def watch(
 
 @app.command()
 def serve(
-    transport: str = typer.Option(
-        "stdio",
+    transport: Transport = typer.Option(
+        Transport.stdio,
         "--transport",
         "-t",
-        help="MCP transport: 'stdio' (default, used by IDE integrations) or 'http'.",
+        case_sensitive=False,
+        help=(
+            "MCP transport. 'stdio' (default) is what Claude Code, Cursor, "
+            "Continue, ChatGPT Desktop, Windsurf, and Zed use — the client "
+            "spawns the server and talks over stdin/stdout. 'http' binds an "
+            "HTTP server for cross-machine setups."
+        ),
     ),
-    host: str = typer.Option("127.0.0.1", "--host", help="HTTP bind host (HTTP transport only)."),
-    port: int = typer.Option(7777, "--port", "-p", help="HTTP port (HTTP transport only)."),
-    config_path: Path | None = typer.Option(None, "--config", "-c"),
+    host: str = typer.Option(
+        "127.0.0.1", "--host", help="HTTP bind host. Only used when --transport=http."
+    ),
+    port: int = typer.Option(
+        7777, "--port", "-p", help="HTTP port. Only used when --transport=http."
+    ),
+    config_path: Path | None = typer.Option(
+        None, "--config", "-c", help="Path to config.toml. Defaults to ~/.lookback/config.toml."
+    ),
 ) -> None:
     """Run the Lookback MCP server.
 
@@ -432,18 +536,18 @@ def serve(
     config = LookbackConfig.load(config_path)
     server = create_server(config)
 
-    if transport == "stdio":
+    if transport is Transport.stdio:
         # stdio uses stdout for protocol traffic, so log everything else to stderr.
         err_console.print(
             f"[bold]lookback MCP server[/] (stdio) — data_dir={config.data_dir}"
         )
         server.run()
-    elif transport == "http":
+    elif transport is Transport.http:
         err_console.print(
             f"[bold]lookback MCP server[/] (http) — http://{host}:{port}"
         )
         server.run(transport="http", host=host, port=port)
-    else:
+    else:  # pragma: no cover — enum exhausted above
         raise typer.BadParameter(
             f"--transport must be 'stdio' or 'http' (got {transport!r})"
         )

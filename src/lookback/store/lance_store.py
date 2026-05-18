@@ -234,6 +234,29 @@ class LanceStore:
         self.files_table().delete(f"file_id IN ({safe_ids})")
         return self.add_files(fs)
 
+    def get_files_paths(self, file_ids: Iterable[str]) -> dict[str, str]:
+        """Resolve ``file_id -> absolute path`` for a batch of ids.
+
+        Used by the CLI search renderer to turn raw hits into clickable
+        ``file://`` links. One scan of the files table per query, even
+        when there are many hits.
+        """
+        ids = list(dict.fromkeys(file_ids))
+        if not ids:
+            return {}
+        safe = ", ".join(
+            f"'{fid.replace(chr(39), chr(39) + chr(39))}'" for fid in ids
+        )
+        rows = (
+            self.files_table()
+            .search()
+            .where(f"file_id IN ({safe})")
+            .select(["file_id", "path"])
+            .limit(len(ids))
+            .to_list()
+        )
+        return {r["file_id"]: r["path"] for r in rows}
+
     def get_file(self, file_id: str) -> dict[str, Any] | None:
         """Return the single ``files`` row matching ``file_id`` or None."""
         safe = file_id.replace("'", "''")

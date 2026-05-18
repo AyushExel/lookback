@@ -31,10 +31,13 @@ Batching (added in v0.1.2):
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pathspec
 
 from lookback.embed.base import ImageEmbedder, TextEmbedder
 from lookback.extract.base import ExtractedChunk
@@ -54,22 +57,53 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_IGNORE_DIRS = frozenset(
     {
-        "node_modules",
+        # Language toolchains / virtualenvs
         ".venv",
         "venv",
+        "env",
+        ".env",
+        "__pypackages__",
+        # Version control
         ".git",
+        ".hg",
+        ".svn",
+        # Python ecosystem caches
         "__pycache__",
-        "target",
-        "build",
-        "dist",
         ".pytest_cache",
         ".ruff_cache",
         ".mypy_cache",
         ".tox",
+        # Build / output trees
+        "build",
+        "dist",
+        "target",
+        "out",
+        ".gradle",
+        # Node.js / JS frameworks
+        "node_modules",
+        ".next",
+        ".nuxt",
+        ".parcel-cache",
+        ".turbo",
+        # Infra / IaC
+        ".terraform",
+        # Coverage reports
+        "coverage",
+        "htmlcov",
+        # IDEs (data, not source — covered by hidden-skip too but make explicit)
         ".idea",
         ".vscode",
+        ".vs",
+        # macOS
+        "$RECYCLE.BIN",
     }
 )
+
+# Names of per-directory ignore files we read at walk time. Lines from all
+# present files are unioned into the directory's PathSpec. Match precedence
+# follows ``gitwildmatch`` (the same syntax git itself uses), so negation
+# patterns (``!important.log``) work as expected.
+DEFAULT_IGNORE_FILES = (".gitignore", ".lookbackignore")
 
 DEFAULT_FLUSH_CHUNK_THRESHOLD = 2000
 DEFAULT_FLUSH_FILE_THRESHOLD = 200
@@ -120,6 +154,33 @@ class _Buffer:
 ProgressCallback = Callable[[Path, IndexStats], None]
 
 
+def _is_ancestor_or_self(ancestor: Path, descendant: Path) -> bool:
+    try:
+        descendant.relative_to(ancestor)
+        return True
+    except ValueError:
+        return False
+
+
+def _matches_any_spec(
+    path: Path,
+    ignore_stack: list[tuple[Path, pathspec.PathSpec]],
+    *,
+    is_dir: bool,
+) -> bool:
+    for ancestor_dir, spec in ignore_stack:
+        try:
+            rel = path.relative_to(ancestor_dir)
+        except ValueError:
+            continue
+        rel_str = str(rel).replace(os.sep, "/")
+        if is_dir:
+            rel_str += "/"
+        if spec.match_file(rel_str):
+            return True
+    return False
+
+
 class Indexer:
     def __init__(
         self,
@@ -132,6 +193,8 @@ class Indexer:
         skip_hidden: bool = True,
         follow_symlinks: bool = False,
         ignore_dirs: frozenset[str] = DEFAULT_IGNORE_DIRS,
+        respect_gitignore: bool = True,
+        ignore_files: tuple[str, ...] = DEFAULT_IGNORE_FILES,
         flush_chunk_threshold: int = DEFAULT_FLUSH_CHUNK_THRESHOLD,
         flush_file_threshold: int = DEFAULT_FLUSH_FILE_THRESHOLD,
         optimize_every_n_flushes: int = DEFAULT_OPTIMIZE_EVERY_N_FLUSHES,
@@ -159,6 +222,15 @@ class Indexer:
         self._skip_hidden = skip_hidden
         self._follow_symlinks = follow_symlinks
         self._ignore_dirs = ignore_dirs
+        # The set of per-directory ignore-file names that contribute patterns.
+        # We always honour ``.lookbackignore``; ``.gitignore`` opts in via
+        # ``respect_gitignore`` (default on).
+        if respect_gitignore:
+            self._ignore_filenames = tuple(ignore_files)
+        else:
+            self._ignore_filenames = tuple(
+                n for n in ignore_files if n != ".gitignore"
+            )
         self._flush_chunk_threshold = flush_chunk_threshold
         self._flush_file_threshold = flush_file_threshold
         self._optimize_every_n_flushes = optimize_every_n_flushes
@@ -235,20 +307,99 @@ class Indexer:
         return count
 
     def _walk(self, root: Path) -> Iterator[Path]:
+        """Yield indexable files under ``root``.
+
+        Uses ``os.walk`` so we can:
+          1. Prune ignored directories in-place (don't descend into them).
+          2. Load ``.gitignore`` / ``.lookbackignore`` at each level and apply
+             their patterns to descendants (a la git itself).
+        Empty / nonexistent / single-file roots are handled as edge cases.
+        """
         if root.is_file():
             if not self._should_skip_file(root):
                 yield root
             return
         if not root.exists():
             return
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            if self._should_skip_file(path, root=root):
-                continue
-            yield path
+
+        # Stack of (directory, PathSpec). Patterns from a spec at directory D
+        # apply only to files at D and below. Ancestor specs are stacked so we
+        # can match each file against every applicable ignore file.
+        ignore_stack: list[tuple[Path, pathspec.PathSpec]] = []
+
+        for dirpath_str, dirnames, filenames in os.walk(
+            str(root), followlinks=self._follow_symlinks
+        ):
+            dirpath = Path(dirpath_str)
+
+            # Pop stack entries that aren't ancestors of the current dir
+            # (happens when os.walk back-tracks out of a subtree).
+            while ignore_stack and not _is_ancestor_or_self(
+                ignore_stack[-1][0], dirpath
+            ):
+                ignore_stack.pop()
+
+            # Add a new spec for this directory if any ignore files exist.
+            local_spec = self._load_ignore_spec(dirpath)
+            if local_spec is not None:
+                ignore_stack.append((dirpath, local_spec))
+
+            # Prune subdirectories in place so os.walk doesn't descend.
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if not self._should_skip_dir(dirpath, d, ignore_stack)
+            ]
+
+            for fname in filenames:
+                fp = dirpath / fname
+                if self._should_skip_file_in_walk(fp, fname, ignore_stack):
+                    continue
+                yield fp
+
+    def _should_skip_dir(
+        self,
+        parent: Path,
+        dirname: str,
+        ignore_stack: list[tuple[Path, pathspec.PathSpec]],
+    ) -> bool:
+        if dirname in self._ignore_dirs:
+            return True
+        if self._skip_hidden and dirname.startswith(".") and dirname not in {
+            ".",
+            "..",
+        }:
+            return True
+        full = parent / dirname
+        if not self._follow_symlinks and full.is_symlink():
+            return True
+        # Trailing slash signals "this is a directory" to gitwildmatch so
+        # patterns like ``build/`` match correctly.
+        return _matches_any_spec(full, ignore_stack, is_dir=True)
+
+    def _should_skip_file_in_walk(
+        self,
+        path: Path,
+        fname: str,
+        ignore_stack: list[tuple[Path, pathspec.PathSpec]],
+    ) -> bool:
+        if not self._follow_symlinks and path.is_symlink():
+            return True
+        if self._skip_hidden and fname.startswith("."):
+            # Per-dir ignore files (.gitignore, .lookbackignore) are also
+            # hidden — they're consumed by ``_load_ignore_spec`` but should
+            # not themselves be indexed.
+            return True
+        if fname in self._ignore_filenames:
+            return True
+        return _matches_any_spec(path, ignore_stack, is_dir=False)
 
     def _should_skip_file(self, path: Path, *, root: Path | None = None) -> bool:
+        """Used by the watcher's per-file events. The ignore-stack walk only
+        applies during ``index_path``; for one-off events we fall back to the
+        legacy dir-name + hidden-prefix checks plus a search-for-parent for
+        any applicable ignore file.
+        """
         if path.is_symlink() and not self._follow_symlinks:
             return True
         parts = path.parts
@@ -263,6 +414,21 @@ class Indexer:
                 if part.startswith(".") and part not in {".", ".."}:
                     return True
         return False
+
+    def _load_ignore_spec(self, dirpath: Path) -> pathspec.PathSpec | None:
+        lines: list[str] = []
+        for fname in self._ignore_filenames:
+            f = dirpath / fname
+            if not f.is_file():
+                continue
+            try:
+                lines.extend(f.read_text(encoding="utf-8", errors="replace").splitlines())
+            except OSError:
+                logger.debug("failed reading %s", f, exc_info=True)
+        if not lines:
+            return None
+        # pathspec 1.x renamed the parser; "gitignore" is the modern name.
+        return pathspec.PathSpec.from_lines("gitignore", lines)
 
     def _process_file(self, path: Path, stats: IndexStats) -> None:
         """Extract + embed + stage into the buffer. No Lance writes here."""
