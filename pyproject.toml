@@ -2,7 +2,7 @@
 # PyPI distribution name. The Python import name and CLI binary are still
 # `lookback` — only the pip-install handle differs (scikit-learn pattern).
 name = "lookback-ai"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local-first multimodal semantic memory for your machine — searchable text + screenshots, MCP-native, runs on CPU."
 readme = "README.md"
 requires-python = ">=3.11"

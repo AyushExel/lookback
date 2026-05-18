@@ -27,7 +27,7 @@ lookback search "mountains and clouds in a landscape" \
 
 </td>
 <td width="45%" valign="middle" align="center">
-<img src="docs/images/landscape.png" width="320" alt="generated landscape with mountains and clouds"/>
+<img src="https://raw.githubusercontent.com/AyushExel/lookback/main/docs/images/landscape.png" width="320" alt="generated landscape with mountains and clouds"/>
 </td>
 </tr>
 
@@ -43,7 +43,7 @@ lookback search "a dog sitting on grass" \
 
 </td>
 <td width="45%" valign="middle" align="center">
-<img src="docs/images/dog.png" width="320" alt="generated illustration of a brown dog sitting on grass"/>
+<img src="https://raw.githubusercontent.com/AyushExel/lookback/main/docs/images/dog.png" width="320" alt="generated illustration of a brown dog sitting on grass"/>
 </td>
 </tr>
 
@@ -59,7 +59,7 @@ lookback search "a neural network architecture diagram" \
 
 </td>
 <td width="45%" valign="middle" align="center">
-<img src="docs/images/diagram.png" width="320" alt="generated multi-layer neural network diagram"/>
+<img src="https://raw.githubusercontent.com/AyushExel/lookback/main/docs/images/diagram.png" width="320" alt="generated multi-layer neural network diagram"/>
 </td>
 </tr>
 </table>
