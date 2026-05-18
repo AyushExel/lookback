@@ -94,6 +94,12 @@ class LanceStore:
         self.path = Path(path).expanduser().resolve()
         self.path.mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(str(self.path))
+        # Table handles are cached per-store so we don't pay a manifest re-read
+        # on every ``files_table()`` / ``chunks_text_table()`` access — the
+        # indexer calls those once per file, and on a 10k-file walk that's
+        # what dominates wall-clock time. Writes through a cached handle
+        # remain visible to subsequent reads through the same handle.
+        self._table_cache: dict[str, Any] = {}
 
     def table_names(self) -> list[str]:
         """Return the names of every table currently in the store.
@@ -119,8 +125,13 @@ class LanceStore:
         bitmap_cols: tuple[str, ...] = (),
         btree_cols: tuple[str, ...] = (),
     ) -> Any:
+        cached = self._table_cache.get(name)
+        if cached is not None:
+            return cached
         if name in self.table_names():
-            return self._db.open_table(name)
+            table = self._db.open_table(name)
+            self._table_cache[name] = table
+            return table
         table = self._db.create_table(name, schema=schema)
         for col in bitmap_cols:
             try:
@@ -132,6 +143,7 @@ class LanceStore:
                 table.create_scalar_index(col, index_type="BTREE")
             except Exception as exc:
                 logger.debug("btree index deferred on %s.%s: %s", name, col, exc)
+        self._table_cache[name] = table
         return table
 
     def chunks_text_table(self) -> Any:
@@ -188,8 +200,22 @@ class LanceStore:
 
     def delete_chunks_by_file_id(self, file_id: str) -> None:
         """Remove every chunk (text and image) belonging to ``file_id``."""
-        safe = file_id.replace("'", "''")
-        predicate = f"file_id = '{safe}'"
+        self.delete_chunks_by_file_ids([file_id])
+
+    def delete_chunks_by_file_ids(self, file_ids: Iterable[str]) -> None:
+        """Bulk-remove every chunk belonging to *any* of the listed file ids.
+
+        Single ``IN (...)`` delete per chunk table — a batched re-index pass
+        of N changed files commits two deletes instead of 2N, matching the
+        perf-guide guidance against per-row writes.
+        """
+        ids = list(dict.fromkeys(file_ids))  # de-dupe while preserving order
+        if not ids:
+            return
+        safe = ", ".join(
+            f"'{fid.replace(chr(39), chr(39) + chr(39))}'" for fid in ids
+        )
+        predicate = f"file_id IN ({safe})"
         for tbl in (self.chunks_text_table(), self.chunks_image_table()):
             tbl.delete(predicate)
 

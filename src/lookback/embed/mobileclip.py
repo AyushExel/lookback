@@ -26,6 +26,10 @@ from lookback.embed.models import IMAGE_MODELS, ImageModelSpec, image_model
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_IMAGE_BATCH_SIZE = 8
+DEFAULT_TEXT_BATCH_SIZE = 32
+
+
 class MobileCLIPImageEmbedder(ImageEmbedder):
     def __init__(
         self,
@@ -33,9 +37,13 @@ class MobileCLIPImageEmbedder(ImageEmbedder):
         *,
         spec: ImageModelSpec | None = None,
         model_name: str = "mobileclip-s2",
+        batch_size: int = DEFAULT_IMAGE_BATCH_SIZE,
     ) -> None:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
         self._model_path = Path(model_path).expanduser()
         self._spec = spec if spec is not None else image_model(model_name)
+        self._batch_size = batch_size
         self._session: object | None = None
 
     @property
@@ -71,17 +79,21 @@ class MobileCLIPImageEmbedder(ImageEmbedder):
         if not image_paths:
             return []
         self._ensure_loaded()
-        assert self._session is not None
+        out: list[list[float]] = []
+        for start in range(0, len(image_paths), self._batch_size):
+            sub = image_paths[start : start + self._batch_size]
+            out.extend(self._embed_one_batch(sub))
+        return out
 
+    def _embed_one_batch(self, image_paths: list[Path]) -> list[list[float]]:
+        assert self._session is not None
         batch = np.stack(
             [self._preprocess(Path(p)) for p in image_paths], axis=0
         ).astype(np.float32)
         outputs = self._session.run(None, {self._spec.pixel_input_name: batch})
         embeddings = np.asarray(outputs[0], dtype=np.float32)
-
         if embeddings.shape[-1] != self._spec.dim:
             embeddings = embeddings[..., : self._spec.dim]
-
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1.0, norms)
         normalized = embeddings / norms
@@ -131,10 +143,14 @@ class MobileCLIPTextEmbedder:
         *,
         spec: ImageModelSpec | None = None,
         model_name: str = "mobileclip-s2",
+        batch_size: int = DEFAULT_TEXT_BATCH_SIZE,
     ) -> None:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
         self._model_path = Path(model_path).expanduser()
         self._tokenizer_path = Path(tokenizer_path).expanduser()
         self._spec = spec if spec is not None else image_model(model_name)
+        self._batch_size = batch_size
         self._session: object | None = None
         self._tokenizer: object | None = None
 
@@ -181,12 +197,17 @@ class MobileCLIPTextEmbedder:
         if not texts:
             return []
         self._ensure_loaded()
+        out: list[list[float]] = []
+        for start in range(0, len(texts), self._batch_size):
+            sub = texts[start : start + self._batch_size]
+            out.extend(self._embed_one_batch(sub))
+        return out
+
+    def _embed_one_batch(self, texts: list[str]) -> list[list[float]]:
         assert self._session is not None
         assert self._tokenizer is not None
-
         encodings = self._tokenizer.encode_batch(texts)
         input_ids = np.asarray([e.ids for e in encodings], dtype=np.int64)
-
         # Some CLIP text-encoder ONNX exports require only input_ids; others
         # also accept attention_mask. Introspect and pass what the model wants.
         input_names = {inp.name for inp in self._session.get_inputs()}
@@ -195,7 +216,6 @@ class MobileCLIPTextEmbedder:
             feed["attention_mask"] = np.asarray(
                 [e.attention_mask for e in encodings], dtype=np.int64
             )
-
         outputs = self._session.run(None, feed)
         embeddings = np.asarray(outputs[0], dtype=np.float32)
         if embeddings.shape[-1] != self._spec.dim:

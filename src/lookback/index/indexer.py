@@ -12,12 +12,26 @@ Incremental indexing contract:
 - When content changes, we delete every chunk with that ``file_id`` from
   both chunk tables, then write the freshly extracted chunks. This is the
   perf-guide-recommended pattern over ``merge_insert``.
+
+Batching (added in v0.1.2):
+
+- Extraction + embedding happen per file (an unavoidable per-file cost),
+  but Lance writes are *deferred* into an internal buffer and flushed in
+  bulk. Each flush issues at most one delete per chunk table, one bulk
+  add per chunk table, and one ``upsert_files`` call — no matter how many
+  files contributed to the buffer.
+- ``flush_chunk_threshold`` (default 2000) caps how many chunks pile up
+  before a flush. ``flush_file_threshold`` (default 200) is the parallel
+  cap on files. Whichever fires first triggers the flush.
+- After every ``optimize_every_n_flushes`` flushes (default 10) the store
+  is compacted (``optimize()``) to keep fragment count and version count
+  bounded. A final ``optimize()`` runs at the end of ``index_path``.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,6 +71,10 @@ DEFAULT_IGNORE_DIRS = frozenset(
     }
 )
 
+DEFAULT_FLUSH_CHUNK_THRESHOLD = 2000
+DEFAULT_FLUSH_FILE_THRESHOLD = 200
+DEFAULT_OPTIMIZE_EVERY_N_FLUSHES = 10
+
 
 @dataclass
 class IndexStats:
@@ -67,6 +85,39 @@ class IndexStats:
     chunks_written: int = 0
     errors: int = 0
     errors_by_path: list[tuple[str, str]] = field(default_factory=list)
+    flushes: int = 0
+    optimizations: int = 0
+
+
+@dataclass
+class _Buffer:
+    """Per-flush staging area, cleared on every ``Indexer._flush``."""
+
+    text_records: list[ChunkRecord] = field(default_factory=list)
+    image_records: list[ChunkRecord] = field(default_factory=list)
+    file_records: list[FileRecord] = field(default_factory=list)
+    delete_file_ids: list[str] = field(default_factory=list)
+
+    def chunk_count(self) -> int:
+        return len(self.text_records) + len(self.image_records)
+
+    def is_empty(self) -> bool:
+        return not (
+            self.text_records
+            or self.image_records
+            or self.file_records
+            or self.delete_file_ids
+        )
+
+    def clear(self) -> None:
+        self.text_records.clear()
+        self.image_records.clear()
+        self.file_records.clear()
+        self.delete_file_ids.clear()
+
+
+# Callback signature: (path_just_processed, current_stats).
+ProgressCallback = Callable[[Path, IndexStats], None]
 
 
 class Indexer:
@@ -81,6 +132,9 @@ class Indexer:
         skip_hidden: bool = True,
         follow_symlinks: bool = False,
         ignore_dirs: frozenset[str] = DEFAULT_IGNORE_DIRS,
+        flush_chunk_threshold: int = DEFAULT_FLUSH_CHUNK_THRESHOLD,
+        flush_file_threshold: int = DEFAULT_FLUSH_FILE_THRESHOLD,
+        optimize_every_n_flushes: int = DEFAULT_OPTIMIZE_EVERY_N_FLUSHES,
     ) -> None:
         if text_embedder.dim != TEXT_EMBED_DIM:
             raise ValueError(
@@ -90,6 +144,13 @@ class Indexer:
             raise ValueError(
                 f"image embedder dim {image_embedder.dim} != schema dim {IMAGE_EMBED_DIM}"
             )
+        if flush_chunk_threshold <= 0:
+            raise ValueError("flush_chunk_threshold must be positive")
+        if flush_file_threshold <= 0:
+            raise ValueError("flush_file_threshold must be positive")
+        if optimize_every_n_flushes <= 0:
+            raise ValueError("optimize_every_n_flushes must be positive")
+
         self._store = store
         self._text_embedder = text_embedder
         self._image_embedder = image_embedder
@@ -98,9 +159,23 @@ class Indexer:
         self._skip_hidden = skip_hidden
         self._follow_symlinks = follow_symlinks
         self._ignore_dirs = ignore_dirs
+        self._flush_chunk_threshold = flush_chunk_threshold
+        self._flush_file_threshold = flush_file_threshold
+        self._optimize_every_n_flushes = optimize_every_n_flushes
+        self._buffer = _Buffer()
 
-    def index_path(self, root: Path) -> IndexStats:
-        """Index a file or recursively index a directory tree."""
+    def index_path(
+        self,
+        root: Path,
+        *,
+        on_file: ProgressCallback | None = None,
+    ) -> IndexStats:
+        """Index a file or recursively index a directory tree.
+
+        ``on_file``, if supplied, is invoked after each file is processed
+        with ``(path, stats)``. The CLI uses it to advance a progress bar;
+        tests pass ``None``.
+        """
         stats = IndexStats()
         root = Path(root).expanduser().resolve()
         for path in self._walk(root):
@@ -110,12 +185,27 @@ class Indexer:
                 logger.warning("indexing %s failed: %s", path, exc)
                 stats.errors += 1
                 stats.errors_by_path.append((str(path), str(exc)))
+
+            if on_file is not None:
+                on_file(path, stats)
+
+            if self._buffer.chunk_count() >= self._flush_chunk_threshold or (
+                len(self._buffer.file_records) >= self._flush_file_threshold
+            ):
+                self._flush(stats)
+
+        # Final flush + compaction.
+        self._flush(stats)
+        if stats.files_indexed > 0:
+            try:
+                self._store.optimize()
+                stats.optimizations += 1
+            except Exception as exc:
+                logger.warning("final optimize failed: %s", exc)
         return stats
 
     def index_file(self, path: Path) -> IndexStats:
-        """Index a single file. Public counterpart to the recursive walk —
-        the watcher uses this when it receives a per-file event.
-        """
+        """Index a single file. The watcher uses this on per-file events."""
         stats = IndexStats()
         path = Path(path).expanduser().resolve()
         if not path.is_file():
@@ -129,19 +219,18 @@ class Indexer:
             logger.warning("indexing %s failed: %s", path, exc)
             stats.errors += 1
             stats.errors_by_path.append((str(path), str(exc)))
+        self._flush(stats)
         return stats
 
     def delete_path(self, path: Path) -> int:
-        """Remove every chunk + the file row for ``path``. Returns the chunk
-        count that was deleted (0 if the path wasn't indexed).
-        """
+        """Remove every chunk + the file row for ``path``. Returns chunk count."""
         path = Path(path).expanduser().resolve()
         file_id = file_id_for_path(path)
         existing = self._store.get_file(file_id)
         if not existing:
             return 0
         count = int(existing.get("chunk_count", 0))
-        self._store.delete_chunks_by_file_id(file_id)
+        self._store.delete_chunks_by_file_ids([file_id])
         self._store.delete_files_by_file_id(file_id)
         return count
 
@@ -176,6 +265,7 @@ class Indexer:
         return False
 
     def _process_file(self, path: Path, stats: IndexStats) -> None:
+        """Extract + embed + stage into the buffer. No Lance writes here."""
         stats.files_seen += 1
 
         try:
@@ -205,30 +295,57 @@ class Indexer:
             return
 
         if existing:
-            self._store.delete_chunks_by_file_id(file_id)
+            self._buffer.delete_file_ids.append(file_id)
 
         mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
         text_records, image_records = self._build_records(
             extracted, file_id=file_id, mtime=mtime
         )
 
-        self._store.add_chunks(text_records, image=False)
-        self._store.add_chunks(image_records, image=True)
-
-        file_record = FileRecord(
-            file_id=file_id,
-            path=str(path),
-            content_hash=content_hash,
-            bytes=size,
-            mtime=mtime,
-            last_indexed_at=datetime.now(UTC),
-            extractor=extractor.__class__.__name__,
-            chunk_count=len(text_records) + len(image_records),
-            status="ok",
+        self._buffer.text_records.extend(text_records)
+        self._buffer.image_records.extend(image_records)
+        self._buffer.file_records.append(
+            FileRecord(
+                file_id=file_id,
+                path=str(path),
+                content_hash=content_hash,
+                bytes=size,
+                mtime=mtime,
+                last_indexed_at=datetime.now(UTC),
+                extractor=extractor.__class__.__name__,
+                chunk_count=len(text_records) + len(image_records),
+                status="ok",
+            )
         )
-        self._store.upsert_files([file_record])
         stats.files_indexed += 1
         stats.chunks_written += len(text_records) + len(image_records)
+
+    def _flush(self, stats: IndexStats) -> None:
+        """Drain the buffer into Lance — bulk delete + bulk add + upsert.
+
+        At most one delete per chunk table, one add per chunk table, one
+        upsert on the files table — regardless of how many files were
+        buffered. Periodic optimize keeps fragment count bounded.
+        """
+        if self._buffer.is_empty():
+            return
+
+        if self._buffer.delete_file_ids:
+            self._store.delete_chunks_by_file_ids(self._buffer.delete_file_ids)
+        self._store.add_chunks(self._buffer.text_records, image=False)
+        self._store.add_chunks(self._buffer.image_records, image=True)
+        if self._buffer.file_records:
+            self._store.upsert_files(self._buffer.file_records)
+
+        self._buffer.clear()
+        stats.flushes += 1
+
+        if stats.flushes % self._optimize_every_n_flushes == 0:
+            try:
+                self._store.optimize()
+                stats.optimizations += 1
+            except Exception as exc:
+                logger.warning("periodic optimize failed: %s", exc)
 
     def _build_records(
         self,

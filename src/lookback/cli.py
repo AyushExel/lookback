@@ -163,6 +163,11 @@ def index(
         "-c",
         help="Path to config.toml.",
     ),
+    no_progress: bool = typer.Option(
+        False,
+        "--no-progress",
+        help="Disable the live progress display.",
+    ),
 ) -> None:
     """Index a file or directory tree."""
     config = LookbackConfig.load(config_path)
@@ -183,8 +188,63 @@ def index(
         skip_hidden=config.skip_hidden,
         follow_symlinks=config.follow_symlinks,
     )
-    stats = indexer.index_path(target)
+
+    stats = _run_index_with_progress(indexer, target, disabled=no_progress)
     _print_index_stats(stats)
+
+
+def _run_index_with_progress(
+    indexer: Indexer, target: Path, *, disabled: bool
+) -> IndexStats:
+    """Run ``indexer.index_path`` with a live spinner + running counts.
+
+    Auto-disables when stdout isn't a TTY (e.g. when output is piped or
+    captured by the test harness) so it never pollutes machine-readable
+    output.
+    """
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    use_progress = not disabled and console.is_terminal
+    if not use_progress:
+        return indexer.index_path(target)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]Indexing[/]"),
+        TextColumn(
+            "files [green]{task.fields[indexed]}[/] indexed · "
+            "[dim]{task.fields[seen]} scanned[/] · "
+            "[magenta]{task.fields[chunks]}[/] chunks · "
+            "[yellow]{task.fields[flushes]}[/] flushes"
+        ),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        task_id = progress.add_task(
+            "idx",
+            total=None,
+            indexed=0,
+            seen=0,
+            chunks=0,
+            flushes=0,
+        )
+
+        def on_file(_path: Path, stats: IndexStats) -> None:
+            progress.update(
+                task_id,
+                indexed=stats.files_indexed,
+                seen=stats.files_seen,
+                chunks=stats.chunks_written,
+                flushes=stats.flushes,
+            )
+
+        return indexer.index_path(target, on_file=on_file)
 
 
 @app.command()
@@ -476,7 +536,8 @@ def _print_index_stats(stats: IndexStats) -> None:
         f"[green]Indexed[/] {stats.files_indexed} file(s), "
         f"[green]wrote[/] {stats.chunks_written} chunk(s); "
         f"unchanged={stats.files_unchanged} skipped={stats.files_skipped} "
-        f"errors={stats.errors}"
+        f"errors={stats.errors} · "
+        f"[dim]flushes={stats.flushes} optimizations={stats.optimizations}[/]"
     )
     if stats.errors_by_path:
         err_console.print("[yellow]errors:[/]")

@@ -28,6 +28,13 @@ DEFAULT_DIM = 768
 DEFAULT_MAX_LENGTH = 512
 DEFAULT_DOCUMENT_PREFIX = "search_document: "
 DEFAULT_QUERY_PREFIX = "search_query: "
+# Cap on how many sequences we hand to ONNX in a single call. For Nomic
+# v1.5 with seq_len=512 and hidden=768, each batch of 32 produces a
+# (32, 512, 768) float32 last_hidden_state tensor — ~48 MB intermediate.
+# Without this cap, embedding a single large file (a PDF or log producing
+# thousands of chunks) explodes RAM into the multi-GB range. See
+# https://github.com/AyushExel/lookback#performance for context.
+DEFAULT_BATCH_SIZE = 32
 
 
 class NomicTextEmbedder(TextEmbedder):
@@ -40,7 +47,10 @@ class NomicTextEmbedder(TextEmbedder):
         max_length: int = DEFAULT_MAX_LENGTH,
         document_prefix: str = DEFAULT_DOCUMENT_PREFIX,
         query_prefix: str = DEFAULT_QUERY_PREFIX,
+        batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> None:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
         self._model_path = Path(model_path).expanduser()
         if tokenizer_path is None:
             self._tokenizer_path = self._model_path.parent / "tokenizer.json"
@@ -50,6 +60,7 @@ class NomicTextEmbedder(TextEmbedder):
         self._max_length = max_length
         self._document_prefix = document_prefix
         self._query_prefix = query_prefix
+        self._batch_size = batch_size
         self._session: object | None = None
         self._tokenizer: object | None = None
 
@@ -101,7 +112,25 @@ class NomicTextEmbedder(TextEmbedder):
         return self._embed([text], prefix=self._query_prefix)[0]
 
     def _embed(self, texts: list[str], *, prefix: str) -> list[list[float]]:
+        """Mini-batched ONNX inference.
+
+        Splits ``texts`` into chunks of ``self._batch_size`` and runs the
+        session once per chunk, so peak memory is bounded by the per-batch
+        intermediate tensor (~48 MB for the defaults) regardless of how
+        many chunks a single file produces.
+        """
+        if not texts:
+            return []
         self._ensure_loaded()
+        out: list[list[float]] = []
+        for start in range(0, len(texts), self._batch_size):
+            sub = texts[start : start + self._batch_size]
+            out.extend(self._embed_one_batch(sub, prefix=prefix))
+        return out
+
+    def _embed_one_batch(
+        self, texts: list[str], *, prefix: str
+    ) -> list[list[float]]:
         assert self._session is not None
         assert self._tokenizer is not None
 
