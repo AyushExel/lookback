@@ -7,6 +7,72 @@ Index your files, code, PDFs, browser history, and **screenshots** into a
 *or* from any MCP-capable AI tool (Claude Code, Cursor, Continue, ChatGPT
 Desktop, Windsurf, Zed). Everything runs on-device — no cloud, no GPU.
 
+## See it in action
+
+Type a description of an image. Get the image back. No captions, no
+filenames, no manual tagging — MobileCLIP2-S2 embeds the query and your
+screenshots into the same vision-language space, so vector similarity
+just works.
+
+<table>
+<tr>
+<td width="55%" valign="middle">
+
+```
+lookback search "mountains and clouds in a landscape" \
+  --modality image
+```
+
+**Top hit:** `landscape.png` &nbsp;·&nbsp; score `0.671`
+
+</td>
+<td width="45%" valign="middle" align="center">
+<img src="docs/images/landscape.png" width="320" alt="generated landscape with mountains and clouds"/>
+</td>
+</tr>
+
+<tr>
+<td width="55%" valign="middle">
+
+```
+lookback search "a dog sitting on grass" \
+  --modality image
+```
+
+**Top hit:** `dog.png` &nbsp;·&nbsp; score `0.752`
+
+</td>
+<td width="45%" valign="middle" align="center">
+<img src="docs/images/dog.png" width="320" alt="generated illustration of a brown dog sitting on grass"/>
+</td>
+</tr>
+
+<tr>
+<td width="55%" valign="middle">
+
+```
+lookback search "a neural network architecture diagram" \
+  --modality image
+```
+
+**Top hit:** `diagram.png` &nbsp;·&nbsp; score `0.634`
+
+</td>
+<td width="45%" valign="middle" align="center">
+<img src="docs/images/diagram.png" width="320" alt="generated multi-layer neural network diagram"/>
+</td>
+</tr>
+</table>
+
+> The images above are programmatically generated PIL primitives (3-10 KB
+> each), not photographs — chosen so you can see *exactly* what
+> MobileCLIP was given. Real screenshots produce sharper score
+> separations.
+
+For the full walkthrough (text search, hybrid FTS+vector, watcher,
+`--source-kind` filters, JSON output, the MCP server), see
+**[EXAMPLES.md](EXAMPLES.md)**.
+
 ## Highlights
 
 - **Multimodal.** Real semantic search over text + screenshots in a single
@@ -115,26 +181,6 @@ Tier 1 (configured in `roots`, on by default):
 - **Screenshots** — `.png`, `.jpg`, `.webp`, `.gif`, `.bmp`. Visually searchable via MobileCLIP.
 
 Skipped: hidden directories, `.gitignore`'d paths, `node_modules`/`.venv`/`target`/`build`/`dist`/etc., files larger than `max_file_bytes` (50 MiB default), symlinks (unless `follow_symlinks = true`).
-
-## Hero demos (with real weights)
-
-```bash
-$ lookback search "fluffy clouds in the sky" --modality image
-Image hits
-┃ score ┃ kind       ┃ meta                    ┃
-│ 0.779 │ screenshot │ {"filename": "sky.png"} │
-│ 0.926 │ screenshot │ {"filename": "dog.png"} │
-
-$ lookback search "transformer attention paper"
-Text hits
-│ 0.309 │ markdown │ {"section": "Attention is all you need", ...} │
-Image hits
-│ 0.836 │ screenshot │ {"filename": "diagram.png"} │
-
-$ lookback search "IVF_PQ tuning" --hybrid
-Text hits
-│ 0.033 │ markdown │ {"section": "IVF_PQ index tuning", ...} │   # exact-keyword boost
-```
 
 ## License
 
