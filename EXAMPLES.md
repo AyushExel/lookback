@@ -71,8 +71,26 @@ Downloading MobileCLIP2-S2 (~150M, 512-d) → ~/.lookback/models/mobileclip-s2
 
 ```text
 $ lookback index /tmp/lookback-demo/src
-Indexed 8 file(s), wrote 11 chunk(s); unchanged=0 skipped=0 errors=0
+⠹ Indexing  files 8 indexed · 8 scanned · 10 chunks · 0 flushes  0:00:04
+Indexed 8 file(s), wrote 10 chunk(s); unchanged=0 skipped=0 errors=0 · flushes=1 optimizations=1
 ```
+
+A live `rich.Progress` spinner runs throughout the walk — the first line
+above is a frozen snapshot of what you see mid-pass. On a larger tree
+the counters tick continuously and the elapsed time advances:
+
+```text
+⠼ Indexing  files 4,827 indexed · 5,012 scanned · 11,394 chunks · 5 flushes  0:08:42
+```
+
+Use `--no-progress` if you'd rather not see it (e.g. when piping output
+or running under a non-TTY shell — in that case it's already disabled
+automatically).
+
+The trailing `flushes=N optimizations=M` part of the summary shows how
+many batched Lance commits the indexer made and how many compaction
+passes ran. Defaults: flush every 2,000 chunks or 200 files; optimize
+every 10 flushes plus once at the end of the walk.
 
 ```text
 $ lookback stats
@@ -270,7 +288,7 @@ has changed. Unchanged files are reported, not re-embedded.
 
 ```text
 $ lookback index /tmp/lookback-demo/src
-Indexed 0 file(s), wrote 0 chunk(s); unchanged=8 skipped=0 errors=0
+Indexed 0 file(s), wrote 0 chunk(s); unchanged=8 skipped=0 errors=0 · flushes=0 optimizations=0
 ```
 
 ### Keeping the index live (`lookback watch`)
