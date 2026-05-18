@@ -73,7 +73,7 @@ For the full walkthrough (text search, hybrid FTS+vector, watcher,
 `--source-kind` filters, JSON output, the MCP server), see
 **[EXAMPLES.md](EXAMPLES.md)**.
 
-## Highlights
+## Features
 
 - **Multimodal.** Real semantic search over text + screenshots in a single
   index. Cross-modal: search for *"fluffy clouds in the sky"* and you'll get
@@ -84,24 +84,6 @@ For the full walkthrough (text search, hybrid FTS+vector, watcher,
   tool to every modern AI assistant. See [`MCP_SETUP.md`](MCP_SETUP.md).
 - **Dev-grade DX.** Single `pip install`, sensible defaults, one config
   file, every subcommand documented.
-
-## Status
-
-| Milestone | Scope | State |
-|---|---|---|
-| M0 | Design + scaffold | ✅ |
-| M1 | Lance schema + store | ✅ |
-| M2 | Text embedder ABC + mock + Nomic adapter; chunking; markdown extractor; indexer | ✅ |
-| M3 | Image embedder mock + screenshot extractor | ✅ |
-| M4 | PDF + code extractors | ✅ |
-| M5 | CLI: init / index / search / stats / models | ✅ |
-| M6 | Model registry, system probe, recommendation, `init` model selection | ✅ |
-| M7 | Real Nomic + MobileCLIP weights wired end-to-end, `@needs_models` smoke tests | ✅ |
-| M8a | Cross-modal text→image search via MobileCLIP joint text tower; `--modality` flag | ✅ |
-| M8b | File watcher (`lookback watch`); MCP server (`lookback serve`); hybrid FTS + vector (`--hybrid`); MCP setup docs | ✅ |
-
-**194 tests, all green** (10 of them gated on real model weights; auto-skip
-when absent). Run `uv sync && uv run pytest -q` to verify.
 
 ## Quick start
 
