@@ -273,9 +273,80 @@ $ lookback index /tmp/lookback-demo/src
 Indexed 0 file(s), wrote 0 chunk(s); unchanged=8 skipped=0 errors=0
 ```
 
-`lookback watch <path>` keeps a long-running process that triggers the
-same per-file logic on filesystem events (add / modify / delete) — see
-the help text for flags.
+### Keeping the index live (`lookback watch`)
+
+For continuous indexing — every file save picked up sub-second — run the
+watcher. Two flavours:
+
+**Foreground.** Useful for verifying behaviour; `Ctrl-C` prints summary
+stats and exits.
+
+```text
+$ lookback watch /tmp/lookback-demo/src
+Watching /tmp/lookback-demo/src (Ctrl-C to stop)
+^C
+Stopped — 3 batch(es), indexed=1 deleted=1 errors=0
+```
+
+**Detached, survives terminal close.** This is the "set it once, leave
+it running until reboot" pattern:
+
+```bash
+nohup lookback watch ~/Documents > ~/.lookback/watch.log 2>&1 &
+echo $! > ~/.lookback/watch.pid     # remember the PID so we can stop it later
+```
+
+Verify it's actually picking up changes by making some and querying for
+the new content. The session below is verbatim against the demo
+workspace:
+
+```text
+$ nohup lookback watch /tmp/lookback-demo/src --config /tmp/lookback-demo/config.toml \
+    > /tmp/lookback-demo/watch.log 2>&1 &
+$ echo $!
+21314
+
+# Add a new section to a tracked file
+$ cat >> /tmp/lookback-demo/src/notes/transformers.md <<'EOF'
+##  Scaling laws
+Training loss follows a power law in compute, parameters, and tokens.
+EOF
+
+# Delete another tracked file
+$ rm /tmp/lookback-demo/src/notes/cooking.md
+
+# The new content is immediately searchable
+$ lookback search "scaling laws training loss power law" --limit 1 --modality text
+Text hits
+┏━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ score ┃ kind     ┃ meta                        ┃ text/file                   ┃
+┡━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ 0.218 │ markdown │ {"section": "Scaling laws", │ Training loss follows a     │
+│       │          │ "section_idx": 3}           │ power law in compute,       │
+│       │          │                             │ parameters, and tokens.     │
+└───────┴──────────┴─────────────────────────────┴─────────────────────────────┘
+
+# The deleted file is gone from the index
+$ lookback stats --config /tmp/lookback-demo/config.toml
+  chunks_text             7         # was 8 before the delete
+  chunks_image            3
+  files                   7         # was 8
+
+# Stop the watcher when you're done
+$ kill $(cat /tmp/lookback-demo/watch.pid)
+```
+
+**Caveats for the detached pattern:**
+
+- **Dies on logout / reboot.** If your laptop sleeps or restarts the
+  process exits and the index goes stale until you start it again. For
+  reboot-persistent watching you'd want a launchd agent on macOS or a
+  systemd user unit on Linux — that's M9 work, not in v0.
+- **The watcher itself logs very little to stdout.** Verify it's
+  working by triggering a change and either checking `lookback stats`
+  or searching for the new content (as shown above).
+- **`watch` doesn't seed the index.** Run `lookback index <path>` once
+  first so the watcher only has to deal with deltas.
 
 ## 9. The MCP server (`lookback serve`)
 
